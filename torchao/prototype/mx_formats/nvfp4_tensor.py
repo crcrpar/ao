@@ -561,6 +561,60 @@ def nvfp4_t(func, types, args, kwargs):
     return new
 
 
+@implements([aten.transpose.int])
+def nvfp4_transpose_int(func, types, args, kwargs):
+    # For now, only transpose(input, 0, 1) is supported.
+    old, dim0, dim1 = args
+    if (dim0, dim1) != (0, 1):
+        raise NotImplementedError(f"NVFP4Tensor: {func} with {dim0=}, {dim1=} is not supported")
+    new = NVFP4Tensor(
+        old._scale_e4m3,
+        old._per_tensor_scale,
+        old._data.t(),
+        old._block_size,
+        old._orig_dtype,
+        old.mm_config,
+        old._is_swizzled_scales,
+        old.use_triton_kernel,
+    )
+    return new
+
+
+@implements([aten.split_with_sizes.default])
+def nvfp4_split_with_sizes(func, types, args, kwargs):
+    old: NVFP4Tensor
+    old, split_sizes, dim = args
+
+    # FIXME: The block scale should need some handling, to say the least.
+    # Theoretically, calling `.to_dtype(old._orig_dtype)`, then splitting the reconstructed, finally
+    # quantizing the split chunks would be the most precise. But currently,
+    # the input in question is puzzling:
+    #   File "/opt/pytorch/ao/torchao/prototype/mx_formats/nvfp4_tensor.py", line 239, in to_dtype
+    #     data = self._data.t() if is_transposed else self._data
+    #            ^^^^^^^^^^^^^^
+    # RuntimeError: t() expects a tensor with <= 2 dimensions, but self is 3D
+    # reconstructed = old.to_dtype(old._orig_dtype)
+    # split_nvfp4 = [
+    #     NVFP4Tensor.to_nvfp4(split, block_size=16, per_tensor_scale=None, mm_config=old.mm_config, is_swizzled_scales=old._is_swizzled_scales, use_triton_kernel=old.use_triton_kernel,)
+    #     for split in aten.split_with_sizes(reconstructed, split_sizes, dim)
+    # ]
+    # return split_nvfp4
+    split_nvfp4 = [
+        NVFP4Tensor(
+            old._scale_e4m3,
+            old._per_tensor_scale,
+            split,
+            old._block_size,
+            old._orig_dtype,
+            old.mm_config,
+            old._is_swizzled_scales,
+            old.use_triton_kernel,
+        )
+        for split in aten.split_with_sizes(old._data, split_sizes, dim)
+    ]
+    return split_nvfp4
+
+
 @implements([aten.view.default])
 def nvfp4_view_op(func, types, args, kwargs):
     data = args[0]._data
@@ -720,6 +774,25 @@ def nvfp4_addmm(func, types, args, kwargs):
                 use_triton_kernel=weight_tensor.use_triton_kernel,
             )
         return _addmm_nvfp4_dispatch(input_tensor, weight_tensor, func, bias=bias)
+
+
+@implements([aten.squeeze.dim])
+def nvfp4_squeeze_dim(func, types, args, kwargs):
+    tensor, dim = args
+    print(f"NVFP4Tensor: squeeze dim: {dim} {tensor.size()=}")
+    if any(s != 1 for s in tensor.size()):
+        return NVFP4Tensor(
+            tensor._scale_e4m3,
+            tensor._per_tensor_scale,    
+            aten.squeeze(tensor._data, dim),
+            tensor._block_size,
+            tensor._orig_dtype,
+            tensor.mm_config,
+            tensor._is_swizzled_scales,
+            tensor.use_triton_kernel,
+        )
+    
+    return tensor
 
 
 def per_tensor_amax_to_scale(amax: torch.Tensor) -> torch.Tensor:
